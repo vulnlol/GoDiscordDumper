@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	_ "time"
 )
 
 type UserInfo struct {
@@ -36,6 +35,9 @@ func getUserInfo(token string) (UserInfo, error) {
 		return UserInfo{}, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return UserInfo{}, fmt.Errorf("failed to get user info, status code: %d", resp.StatusCode)
+	}
 	var userInfo UserInfo
 	err = json.NewDecoder(resp.Body).Decode(&userInfo)
 	if err != nil {
@@ -184,28 +186,42 @@ func scrapData() {
 			}
 			for _, channel := range channels {
 				messages := getMessages(token, channel.ID)
+				if messages == nil {
+					fmt.Println("Error: nil messages received")
+					continue
+				}
 				for _, message := range messages {
+					if message["content"] == nil {
+						fmt.Println("Skipping message with missing content")
+						continue
+					}
 					entryID := uuid.New().String()
 					messageData := map[string]interface{}{
-						"id":              entryID,
-						"authorID":        message["author"].(map[string]interface{})["id"],
-						"serverID":        guild.ID,
-						"authorUsername":  message["author"].(map[string]interface{})["username"],
-						"messageID":       message["id"],
-						"messageContent":  message["content"],
-						"timestamp":       message["timestamp"],
-						"editedTimestamp": message["edited_timestamp"],
+						"id":                     entryID,
+						"discordAuthorID":        message["author"].(map[string]interface{})["id"],
+						"discordServerID":        guild.ID,
+						"discordAuthorUsername":  message["author"].(map[string]interface{})["username"],
+						"discordMessageID":       message["id"],
+						"discordMessageContent":  message["content"],
+						"discordTimestamp":       message["timestamp"],
+						"discordEditedTimestamp": message["edited_timestamp"],
 					}
 					data, err := json.Marshal(messageData)
 					if err != nil {
 						fmt.Println("Error marshalling message data:", err)
 						continue
 					}
-					err = ioutil.WriteFile("message_data.json", append(data, '\n'), 0644)
+					f, err := os.OpenFile("message_data.json", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 					if err != nil {
-						fmt.Println("Error writing message data:", err)
+						fmt.Println("Error opening message log file:", err)
 						continue
 					}
+					defer f.Close()
+					if _, err := f.Write(append(data, '\n')); err != nil {
+						fmt.Println("Error writing to message log file:", err)
+						continue
+					}
+					fmt.Println("Message data appended to message_data.json")
 				}
 			}
 		}
@@ -228,12 +244,37 @@ func getMessages(token, channelID string) []map[string]interface{} {
 		return nil
 	}
 	defer resp.Body.Close()
+
+	var rawMessages json.RawMessage
 	var messages []map[string]interface{}
-	err = json.NewDecoder(resp.Body).Decode(&messages)
+
+	// Read the raw JSON response
+	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		fmt.Println("Error decoding response:", err)
+		fmt.Println("Error reading response body:", err)
 		return nil
 	}
+
+	// Unmarshal into RawMessage
+	err = json.Unmarshal(body, &rawMessages)
+	if err != nil {
+		fmt.Println("Error decoding JSON response:", err)
+		return nil
+	}
+
+	// Check if the response is an object or an array
+	if rawMessages[0] == '{' {
+		// If it's an object, wrap it in an array
+		rawMessages = []byte("[" + string(rawMessages) + "]")
+	}
+
+	// Decode JSON response
+	err = json.Unmarshal(rawMessages, &messages)
+	if err != nil {
+		fmt.Println("Error decoding JSON response:", err)
+		return nil
+	}
+
 	return messages
 }
 
