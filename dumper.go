@@ -172,6 +172,7 @@ func scrapData() {
 			fmt.Println("Error getting user info:", err)
 			continue
 		}
+		fmt.Println("User ID:", userInfo.ID)
 
 		guilds, err := getGuilds(token)
 		if err != nil {
