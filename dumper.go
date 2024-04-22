@@ -8,7 +8,31 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"time"
+	_ "time"
 )
+
+var (
+	httpClient *http.Client
+	fileMutex  sync.Mutex
+)
+
+func init() {
+	// Create a custom HTTP transport with connection pooling
+	transport := &http.Transport{
+		MaxIdleConns:        10,               // Maximum number of idle connections to keep open
+		MaxIdleConnsPerHost: 2,                // Maximum number of idle connections per host
+		IdleConnTimeout:     30 * time.Second, // Idle connection timeout
+	}
+	httpClient = &http.Client{
+		Transport: transport,
+	}
+}
+
+func getUserClient() *http.Client {
+	return httpClient
+}
 
 type UserInfo struct {
 	ID string `json:"id"`
@@ -164,6 +188,8 @@ func scrapData() {
 		return
 	}
 
+	const batchSize = 420 // Define batch size
+
 	for token := range accountsData {
 		userInfo, err := getUserInfo(token)
 		if err != nil {
@@ -184,6 +210,7 @@ func scrapData() {
 				fmt.Println("Error getting channels for guild", guild.Name, ":", err)
 				continue
 			}
+			var messageBuffer []map[string]interface{}
 			for _, channel := range channels {
 				messages := getMessages(token, channel.ID)
 				if messages == nil {
@@ -192,7 +219,9 @@ func scrapData() {
 				}
 				for _, message := range messages {
 					if message["content"] == nil {
-						fmt.Println("Skipping message with missing content")
+						currentTime := time.Now()
+						timeOnly := currentTime.Format("15:04:05")
+						fmt.Println("Skipping message with missing content @ " + timeOnly)
 						continue
 					}
 					entryID := uuid.New().String()
@@ -206,28 +235,47 @@ func scrapData() {
 						"discordTimestamp":       message["timestamp"],
 						"discordEditedTimestamp": message["edited_timestamp"],
 					}
-					data, err := json.Marshal(messageData)
-					if err != nil {
-						fmt.Println("Error marshalling message data:", err)
-						continue
+					messageBuffer = append(messageBuffer, messageData)
+					if len(messageBuffer) >= batchSize {
+						writeBatchToFile(messageBuffer)
+						messageBuffer = nil // Clear buffer
 					}
-					f, err := os.OpenFile("message_data.json", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-					if err != nil {
-						fmt.Println("Error opening message log file:", err)
-						continue
-					}
-					defer f.Close()
-					if _, err := f.Write(append(data, '\n')); err != nil {
-						fmt.Println("Error writing to message log file:", err)
-						continue
-					}
-					fmt.Println("Message data appended to message_data.json")
 				}
+			}
+			// Write remaining messages as a final batch
+			if len(messageBuffer) > 0 {
+				writeBatchToFile(messageBuffer)
 			}
 		}
 	}
 	fmt.Println("User info, guilds, and channels for each token saved to accounts.json.")
 	fmt.Println("Message data saved to message_data.json.")
+}
+
+func writeBatchToFile(messages []map[string]interface{}) {
+	fileMutex.Lock()
+	defer fileMutex.Unlock()
+
+	f, err := os.OpenFile("message_data.json", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Println("Error opening message log file:", err)
+		return
+	}
+	defer f.Close()
+
+	for _, message := range messages {
+		data, err := json.Marshal(message)
+		if err != nil {
+			fmt.Println("Error marshalling message data:", err)
+			continue
+		}
+		data = append(data, '\n') // Add newline after each message
+		if _, err := f.Write(data); err != nil {
+			fmt.Println("Error writing to message log file:", err)
+			continue
+		}
+	}
+	fmt.Printf("Batch of %d messages appended to message_data.json\n", len(messages))
 }
 
 func getMessages(token, channelID string) []map[string]interface{} {
