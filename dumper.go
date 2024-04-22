@@ -3,7 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/google/uuid" // Import the uuid package
+	"github.com/google/uuid"
 	"io/ioutil"
 	"net/http"
 	"os"
@@ -85,7 +85,6 @@ func getChannels(token, guildID string) ([]Channel, error) {
 }
 
 func addToken(token string) {
-	// Read existing data from accounts.json
 	accountsData := make(map[string]interface{})
 	if _, err := os.Stat("accounts.json"); err == nil {
 		file, err := ioutil.ReadFile("accounts.json")
@@ -132,8 +131,6 @@ func addToken(token string) {
 		"user_id": userInfo.ID,
 		"guilds":  guildInfo,
 	}
-
-	// Write updated data to accounts.json
 	data, err := json.MarshalIndent(accountsData, "", "    ")
 	if err != nil {
 		fmt.Println("Error marshalling data:", err)
@@ -148,7 +145,6 @@ func addToken(token string) {
 }
 
 func scrapData() {
-	// Read existing data from accounts.json
 	accountsData := make(map[string]interface{})
 	if _, err := os.Stat("accounts.json"); err == nil {
 		file, err := ioutil.ReadFile("accounts.json")
