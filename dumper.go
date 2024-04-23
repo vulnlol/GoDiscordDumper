@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"github.com/google/uuid"
 	"io/ioutil"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +19,11 @@ var (
 	httpClient *http.Client
 	fileMutex  sync.Mutex
 )
+
+type InviteInfo struct {
+	GuildID   string `json:"guild_id"`
+	GuildName string `json:"guild_name"`
+}
 
 func init() {
 	// Create a custom HTTP transport with connection pooling
@@ -326,13 +333,144 @@ func getMessages(token, channelID string) []map[string]interface{} {
 	return messages
 }
 
+// API for checking server info: https://discord.com/api/v8/invites/owlsec?with_counts=true
+
+// Function to find and log invites
+func findAndLogInvites() {
+	messages := parseMessages()
+	inviteCodes := extractInviteCodes(messages)
+	for _, inviteCode := range inviteCodes {
+		guildID, guildName, inviteLink, err := getInviteInfo(inviteCode)
+		if err != nil {
+			fmt.Println("Error fetching invite info:", err)
+			continue
+		}
+		logInviteInfo(guildID, guildName, inviteLink)
+	}
+}
+
+// Function to parse messages from the message data file
+func parseMessages() []string {
+	var messages []string
+
+	file, err := os.Open("message_data.json")
+	if err != nil {
+		fmt.Println("Error opening message data file:", err)
+		return messages
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		var message map[string]interface{}
+		if err := json.Unmarshal(scanner.Bytes(), &message); err != nil {
+			fmt.Println("Error decoding message:", err)
+			continue
+		}
+		if message["discordMessageContent"] != nil {
+			messages = append(messages, message["discordMessageContent"].(string))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		fmt.Println("Error scanning message data file:", err)
+	}
+	return messages
+}
+
+// Function to extract invite codes from messages
+func extractInviteCodes(messages []string) []string {
+	var inviteCodes []string
+	linkRegex := regexp.MustCompile(`(?:https?://)?discord(?:(?:app)?\.com/invite|\.gg)/(\w{5,32})`)
+
+	for _, msg := range messages {
+		links := linkRegex.FindAllString(msg, -1)
+		for _, link := range links {
+			parts := strings.Split(link, "/")
+			inviteCodes = append(inviteCodes, parts[len(parts)-1])
+		}
+	}
+	return inviteCodes
+}
+
+// Function to retrieve invite information from the Discord API
+func getInviteInfo(inviteCode string) (string, string, string, error) {
+	client := &http.Client{}
+	req, err := http.NewRequest("GET", fmt.Sprintf("https://discord.com/api/v8/invites/%s?with_counts=true", inviteCode), nil)
+	if err != nil {
+		return "", "", "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", "", "", fmt.Errorf("non-OK status code: %d", resp.StatusCode)
+	}
+
+	var inviteInfo struct {
+		GuildID string `json:"guild_id"`
+		Guild   struct {
+			Name string `json:"name"`
+		} `json:"guild,omitempty"`
+		InviteLink string `json:"invite_link"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&inviteInfo)
+	if err != nil {
+		return "", "", "", err
+	}
+
+	guildID := inviteInfo.GuildID
+	guildName := ""
+	if inviteInfo.Guild.Name != "" {
+		guildName = inviteInfo.Guild.Name
+	}
+
+	return guildID, guildName, inviteCode, nil
+}
+
+// Function to log invite information into invites.json
+func logInviteInfo(guildID, guildName, inviteCode string) {
+	fileMutex.Lock()
+	defer fileMutex.Unlock()
+
+	inviteLink := fmt.Sprintf("https://discord.gg/%s", inviteCode)
+
+	inviteData := map[string]interface{}{
+		"guild_id":    guildID,
+		"guild_name":  guildName,
+		"invite_link": inviteLink,
+	}
+
+	data, err := json.Marshal(inviteData)
+	if err != nil {
+		fmt.Println("Error marshalling invite info:", err)
+		return
+	}
+
+	f, err := os.OpenFile("invites.json", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Println("Error opening invites log file:", err)
+		return
+	}
+	defer f.Close()
+
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		fmt.Println("Error writing invite info to file:", err)
+		return
+	}
+}
+
+// Add the findAndLogInvites function call inside the main function
 func main() {
 	var choice string
 	for {
 		fmt.Println("\nMenu:")
 		fmt.Println("1. Add token")
 		fmt.Println("2. Scrap data")
-		fmt.Println("3. Exit")
+		fmt.Println("3. Find and log invites") // Added menu option
+		fmt.Println("4. Exit")
 		fmt.Print("Enter your choice: ")
 		_, err := fmt.Scan(&choice)
 		if err != nil {
@@ -352,6 +490,8 @@ func main() {
 		case "2":
 			scrapData()
 		case "3":
+			findAndLogInvites() // Call the function to find and log invites
+		case "4":
 			os.Exit(0)
 		default:
 			fmt.Println("Invalid choice. Please enter a valid option.")
