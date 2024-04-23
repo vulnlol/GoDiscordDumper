@@ -20,9 +20,12 @@ var (
 	fileMutex  sync.Mutex
 )
 
+type AccountData map[string]interface{}
+
 type InviteInfo struct {
-	GuildID   string `json:"guild_id"`
-	GuildName string `json:"guild_name"`
+	GuildID    string `json:"guild_id"`
+	GuildName  string `json:"guild_name"`
+	InviteLink string `json:"invite_link"`
 }
 
 func init() {
@@ -177,7 +180,7 @@ func addToken(token string) {
 	fmt.Println("Token added successfully.")
 }
 
-func scrapData() {
+func scrapeData() {
 	accountsData := make(map[string]interface{})
 	if _, err := os.Stat("accounts.json"); err == nil {
 		file, err := ioutil.ReadFile("accounts.json")
@@ -333,16 +336,16 @@ func getMessages(token, channelID string) []map[string]interface{} {
 	return messages
 }
 
-// API for checking server info: https://discord.com/api/v8/invites/owlsec?with_counts=true
+// API for checking server info example cause I keep forgetting it cause they don't keep it in the public discord docs: https://discord.com/api/v8/invites/owlsec?with_counts=true
 
 // Function to find and log invites
-func findAndLogInvites() {
+func filterInvites() {
 	messages := parseMessages()
 	inviteCodes := extractInviteCodes(messages)
 	for _, inviteCode := range inviteCodes {
 		guildID, guildName, inviteLink, err := getInviteInfo(inviteCode)
 		if err != nil {
-			fmt.Println("Error fetching invite info:", err)
+			fmt.Printf("Error fetching invite info for invite link '%s': %v\n", inviteLink, err)
 			continue
 		}
 		logInviteInfo(guildID, guildName, inviteLink)
@@ -399,38 +402,53 @@ func getInviteInfo(inviteCode string) (string, string, string, error) {
 	if err != nil {
 		return "", "", "", err
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", "", "", err
-	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return "", "", "", fmt.Errorf("non-OK status code: %d", resp.StatusCode)
+	// Add headers to mimic a real browser request to bypass rate limits
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3")
+
+	for attempt := 1; attempt <= 5; attempt++ { // Maximum 5 retry attempts
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", "", "", err
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			var inviteInfo struct {
+				GuildID string `json:"guild_id"`
+				Guild   struct {
+					Name string `json:"name"`
+				} `json:"guild,omitempty"`
+				InviteLink string `json:"invite_link"`
+			}
+			err = json.NewDecoder(resp.Body).Decode(&inviteInfo)
+			resp.Body.Close()
+			if err != nil {
+				return "", "", "", err
+			}
+
+			guildID := inviteInfo.GuildID
+			guildName := ""
+			if inviteInfo.Guild.Name != "" {
+				guildName = inviteInfo.Guild.Name
+			}
+
+			return guildID, guildName, inviteCode, nil
+		} else if resp.StatusCode == http.StatusTooManyRequests {
+			// If rate limited, wait before retrying
+			backoff := time.Duration(attempt*attempt) * time.Second
+			fmt.Printf("Rate limited. Retrying in %v...\n", backoff)
+			time.Sleep(backoff)
+			continue
+		} else {
+			resp.Body.Close()
+			return "", "", "", fmt.Errorf("non-OK status code: %d", resp.StatusCode)
+		}
 	}
 
-	var inviteInfo struct {
-		GuildID string `json:"guild_id"`
-		Guild   struct {
-			Name string `json:"name"`
-		} `json:"guild,omitempty"`
-		InviteLink string `json:"invite_link"`
-	}
-	err = json.NewDecoder(resp.Body).Decode(&inviteInfo)
-	if err != nil {
-		return "", "", "", err
-	}
-
-	guildID := inviteInfo.GuildID
-	guildName := ""
-	if inviteInfo.Guild.Name != "" {
-		guildName = inviteInfo.Guild.Name
-	}
-
-	return guildID, guildName, inviteCode, nil
+	return "", "", "", fmt.Errorf("maximum retry attempts reached")
 }
 
-// Function to log invite information into invites.json
+// Function to log invite information into invites.jsonl
 func logInviteInfo(guildID, guildName, inviteCode string) {
 	fileMutex.Lock()
 	defer fileMutex.Unlock()
@@ -449,7 +467,7 @@ func logInviteInfo(guildID, guildName, inviteCode string) {
 		return
 	}
 
-	f, err := os.OpenFile("invites.json", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile("invites.jsonl", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		fmt.Println("Error opening invites log file:", err)
 		return
@@ -462,15 +480,283 @@ func logInviteInfo(guildID, guildName, inviteCode string) {
 	}
 }
 
-// Add the findAndLogInvites function call inside the main function
-func main() {
+// Function to manually add invites
+func addInviteManually(inviteCode string) error {
+	guildID, guildName, inviteLink, err := getInviteInfo(inviteCode)
+	if err != nil {
+		return err
+	}
+
+	// Prepare invite data
+	inviteData := map[string]interface{}{
+		"guild_id":    guildID,
+		"guild_name":  guildName,
+		"invite_link": inviteLink,
+	}
+
+	// Marshal invite data
+	data, err := json.Marshal(inviteData)
+	if err != nil {
+		return err
+	}
+
+	// Open invites.jsonl file
+	f, err := os.OpenFile("invites.jsonl", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// Write invite data to file
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		return err
+	}
+
+	fmt.Println("Invite added successfully!")
+	return nil
+}
+
+// Function to remove inactive invites by checking the Discord API
+func removeInactiveInvites() error {
+	// Open the invites.jsonl file
+	file, err := os.Open("invites.jsonl")
+	if err != nil {
+		return fmt.Errorf("error opening invites file: %v", err)
+	}
+	defer file.Close()
+
+	// Create a scanner to read the file line by line
+	scanner := bufio.NewScanner(file)
+
+	// Define a slice to store the invites
+	var invites []map[string]string
+
+	// Iterate over each line in the file
+	for scanner.Scan() {
+		// Decode the JSON object from the line
+		var invite map[string]string
+		if err := json.Unmarshal(scanner.Bytes(), &invite); err != nil {
+			return fmt.Errorf("error decoding invites data: %v", err)
+		}
+
+		// Append the invite to the slice
+		invites = append(invites, invite)
+	}
+
+	// Check for any scanner errors
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading invites file: %v", err)
+	}
+
+	// Iterate over the invites
+	for i := 0; i < len(invites); i++ {
+		// Extract invite details
+		inviteLink := invites[i]["invite_link"]
+
+		// Check invite status using the Discord API
+		active, err := isInviteActive(inviteLink)
+		if err != nil {
+			// Print error message and continue if there's an error
+			fmt.Printf("Error fetching invite info for invite link '%s': %v\n", inviteLink, err)
+			continue
+		}
+
+		// If the invite is not active, remove it from the slice
+		if !active {
+			fmt.Printf("Removing inactive invite: %s\n", inviteLink)
+			invites = append(invites[:i], invites[i+1:]...)
+			i-- // Decrement i to handle the removed element
+		} else {
+			// If the invite is active, print a message
+			fmt.Printf("Invite is active: %s\n", inviteLink)
+		}
+	}
+
+	// Rewrite the invites.jsonl file with the updated data
+	file, err = os.Create("invites.jsonl")
+	if err != nil {
+		return fmt.Errorf("error creating invites file: %v", err)
+	}
+	defer file.Close()
+
+	// Write each invite as a JSON object on a new line
+	for _, invite := range invites {
+		if err := json.NewEncoder(file).Encode(invite); err != nil {
+			return fmt.Errorf("error encoding invites data: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// Function to check if an invite is active using the Discord API
+func isInviteActive(inviteLink string) (bool, error) {
+	// Extract the invite code from the invite link
+	parts := strings.Split(inviteLink, "/")
+	inviteCode := parts[len(parts)-1]
+
+	// Send a GET request to the Discord API to retrieve invite information
+	resp, err := http.Get(fmt.Sprintf("https://discord.com/api/v8/invites/%s?with_counts=true", inviteCode))
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+
+	// Check for non-OK status codes
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil // Invite link not found
+	} else if resp.StatusCode == http.StatusTooManyRequests {
+		return false, fmt.Errorf("rate limited") // Rate limited, handle accordingly
+	} else if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("non-OK status code: %d", resp.StatusCode)
+	}
+
+	// If the response status code is OK, return true
+	return true, nil
+}
+
+func joinMissingGuilds() error {
+	// Read accounts.json file
+	accountsFile, err := os.Open("accounts.json")
+	if err != nil {
+		return fmt.Errorf("failed to open accounts.json: %v", err)
+	}
+	defer accountsFile.Close()
+
+	var accountsData AccountData
+	err = json.NewDecoder(accountsFile).Decode(&accountsData)
+	if err != nil {
+		return fmt.Errorf("failed to decode accounts.json: %v", err)
+	}
+
+	// Read invites.jsonl file
+	invitesFile, err := os.Open("invites.jsonl")
+	if err != nil {
+		return fmt.Errorf("failed to open invites.jsonl: %v", err)
+	}
+	defer invitesFile.Close()
+
+	var invitesData []InviteInfo
+	scanner := bufio.NewScanner(invitesFile)
+	for scanner.Scan() {
+		var invite InviteInfo
+		err := json.Unmarshal(scanner.Bytes(), &invite)
+		if err != nil {
+			fmt.Printf("Error parsing JSON line in invites.jsonl: %v\n", err)
+			continue
+		}
+		invitesData = append(invitesData, invite)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error scanning invites.jsonl: %v", err)
+	}
+
+	// Track guilds that have been successfully joined
+	joinedGuilds := make(map[string]bool)
+
+	// Iterate over each account
+	for token, account := range accountsData {
+		// Check if the account is in every guild listed in invites.jsonl
+		for _, invite := range invitesData {
+			if !isInGuild(account, invite.GuildID) && !joinedGuilds[invite.GuildID] {
+				// Account is not in this guild and guild has not been joined yet, join using the invite link
+				if err := joinServer(token, invite.InviteLink); err != nil {
+					fmt.Printf("Error joining server %s: %v\n", invite.GuildName, err)
+				} else {
+					fmt.Printf("Joined server %s successfully\n", invite.GuildName)
+					// Mark guild as joined to prevent duplicate joins
+					joinedGuilds[invite.GuildID] = true
+				}
+			} else {
+				fmt.Printf("Already a member of server %s\n", invite.GuildName)
+			}
+		}
+	}
+
+	return nil
+}
+
+func isInGuild(account interface{}, guildID string) bool {
+	// Check if the account is valid and contains guilds information
+	acc, ok := account.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	guildsData, ok := acc["guilds"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+
+	// Check if the guild ID is present in the guilds section
+	_, exists := guildsData[guildID]
+	return exists
+}
+
+func joinServer(token, inviteLink string) error {
+	// Create a new POST request
+	req, err := http.NewRequest("POST", inviteLink, nil)
+	if err != nil {
+		return err
+	}
+
+	// Set the Authorization header with the user token
+	req.Header.Set("Authorization", token)
+
+	// Send the POST request using the global HTTP client
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	// Check the response status code
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to join server, status code: %d", resp.StatusCode)
+	}
+
+	fmt.Println("Successfully joined the server!")
+
+	return nil
+}
+
+// Main menu function
+func mainMenu() {
 	var choice string
 	for {
-		fmt.Println("\nMenu:")
-		fmt.Println("1. Add token")
-		fmt.Println("2. Scrap data")
-		fmt.Println("3. Find and log invites") // Added menu option
+		fmt.Println("\nMain Menu:")
+		fmt.Println("1. Account Management")
+		fmt.Println("2. Invite Handling")
+		fmt.Println("3. Scraping Options")
 		fmt.Println("4. Exit")
+		fmt.Print("Enter your choice: ")
+		_, err := fmt.Scan(&choice)
+		if err != nil {
+			fmt.Println("Error reading choice:", err)
+			continue
+		}
+		switch choice {
+		case "1":
+			accountMenu()
+		case "2":
+			inviteMenu()
+		case "3":
+			scrapingMenu()
+		case "4":
+			os.Exit(0)
+		default:
+			fmt.Println("Invalid choice. Please enter a valid option.")
+		}
+	}
+}
+
+// Account menu function
+func accountMenu() {
+	var choice string
+	for {
+		fmt.Println("\nAccount Management:")
+		fmt.Println("1. Add Token")
+		fmt.Println("2. Back to Main Menu")
 		fmt.Print("Enter your choice: ")
 		_, err := fmt.Scan(&choice)
 		if err != nil {
@@ -488,13 +774,87 @@ func main() {
 			}
 			addToken(strings.TrimSpace(token))
 		case "2":
-			scrapData()
-		case "3":
-			findAndLogInvites() // Call the function to find and log invites
-		case "4":
-			os.Exit(0)
+			return
 		default:
 			fmt.Println("Invalid choice. Please enter a valid option.")
 		}
 	}
+}
+
+func inviteMenu() {
+	var choice string
+	for {
+		fmt.Println("\nInvite Handling:")
+		fmt.Println("1. Add Invite Manually")
+		fmt.Println("2. Filter Invites")
+		fmt.Println("3. Check Invite Statuses")
+		fmt.Println("4. Join Missing Guilds")
+		fmt.Println("5. Back to Main Menu")
+		fmt.Print("Enter your choice: ")
+		_, err := fmt.Scan(&choice)
+		if err != nil {
+			fmt.Println("Error reading choice:", err)
+			continue
+		}
+		switch choice {
+		case "1":
+			var inviteCode string
+			fmt.Print("Enter the invite code to add: ")
+			_, err := fmt.Scan(&inviteCode)
+			if err != nil {
+				fmt.Println("Error reading invite code:", err)
+				continue
+			}
+			addInviteManually(inviteCode)
+		case "2":
+			filterInvites()
+		case "3":
+			fmt.Println("\nChecking invite statuses...")
+			if err := removeInactiveInvites(); err != nil {
+				fmt.Println("Error checking invite statuses:", err)
+			} else {
+				fmt.Println("Invite statuses checked successfully.")
+			}
+		case "4":
+			fmt.Println("\nJoining missing guilds...")
+			if err := joinMissingGuilds(); err != nil {
+				fmt.Println("Error joining missing guilds:", err)
+			} else {
+				fmt.Println("Joining missing guilds completed successfully.")
+			}
+		case "5":
+			return
+		default:
+			fmt.Println("Invalid choice. Please enter a valid option.")
+		}
+	}
+}
+
+// Scraping menu function
+func scrapingMenu() {
+	var choice string
+	for {
+		fmt.Println("\nScraping Options:")
+		fmt.Println("1. Scrape Data")
+		fmt.Println("2. Back to Main Menu")
+		fmt.Print("Enter your choice: ")
+		_, err := fmt.Scan(&choice)
+		if err != nil {
+			fmt.Println("Error reading choice:", err)
+			continue
+		}
+		switch choice {
+		case "1":
+			scrapeData()
+		case "2":
+			return
+		default:
+			fmt.Println("Invalid choice. Please enter a valid option.")
+		}
+	}
+}
+
+// Main function
+func main() {
+	mainMenu()
 }
