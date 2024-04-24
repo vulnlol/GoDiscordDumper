@@ -1,6 +1,6 @@
 /.idea
 accounts.json
-message_data.json
+message_data.jsonl
 invites.jsonl
 go.mod
 go.sum

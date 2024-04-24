@@ -101,7 +101,7 @@ func getGuilds(token string) ([]Guild, error) {
 }
 
 func getChannels(token, guildID string) ([]Channel, error) {
-	client := &http.Client{}
+	client := getUserClient() // Use getUserClient() to get the HTTP client
 	req, err := http.NewRequest("GET", fmt.Sprintf("https://discord.com/api/v9/guilds/%s/channels", guildID), nil)
 	if err != nil {
 		return nil, err
@@ -182,91 +182,119 @@ func addToken(token string) {
 
 func scrapeData() {
 	accountsData := make(map[string]interface{})
-	if _, err := os.Stat("accounts.json"); err == nil {
-		file, err := ioutil.ReadFile("accounts.json")
-		if err != nil {
-			fmt.Println("Error reading accounts.json:", err)
-			return
-		}
-		err = json.Unmarshal(file, &accountsData)
-		if err != nil {
-			fmt.Println("Error unmarshalling accounts.json:", err)
-			return
-		}
-	} else {
+	if _, err := os.Stat("accounts.json"); err != nil {
 		fmt.Println("No accounts found. Please add tokens first.")
 		return
 	}
 
-	const batchSize = 420 // Define batch size
+	if file, err := ioutil.ReadFile("accounts.json"); err != nil {
+		fmt.Println("Error reading accounts.json:", err)
+		return
+	} else if err := json.Unmarshal(file, &accountsData); err != nil {
+		fmt.Println("Error unmarshalling accounts.json:", err)
+		return
+	}
+
+	const (
+		batchSize  = 420 // Define batch size
+		maxWorkers = 2   // Max number of concurrent workers
+		fileName   = "message_data.jsonl"
+	)
+
+	var wg sync.WaitGroup
+	messageBuffer := make(chan map[string]interface{}, batchSize)
 
 	for token := range accountsData {
-		userInfo, err := getUserInfo(token)
-		if err != nil {
-			fmt.Println("Error getting user info:", err)
-			continue
-		}
-		fmt.Println("User ID:", userInfo.ID)
-
-		guilds, err := getGuilds(token)
-		if err != nil {
-			fmt.Println("Error getting guilds:", err)
-			continue
-		}
-
-		for _, guild := range guilds {
-			channels, err := getChannels(token, guild.ID)
+		wg.Add(1)
+		go func(token string) {
+			defer wg.Done()
+			userInfo, err := getUserInfo(token)
 			if err != nil {
-				fmt.Println("Error getting channels for guild", guild.Name, ":", err)
-				continue
+				fmt.Println("Error getting user info:", err)
+				return
 			}
-			var messageBuffer []map[string]interface{}
-			for _, channel := range channels {
-				messages := getMessages(token, channel.ID)
-				if messages == nil {
-					fmt.Println("Error: nil messages received")
+			fmt.Println("User ID:", userInfo.ID)
+
+			guilds, err := getGuilds(token)
+			if err != nil {
+				fmt.Println("Error getting guilds:", err)
+				return
+			}
+
+			for _, guild := range guilds {
+				channels, err := getChannels(token, guild.ID)
+				if err != nil {
+					fmt.Println("Error getting channels for guild", guild.Name, ":", err)
 					continue
 				}
-				for _, message := range messages {
-					if message["content"] == nil {
-						currentTime := time.Now()
-						timeOnly := currentTime.Format("15:04:05")
-						fmt.Println("Skipping message with missing content @ " + timeOnly)
-						continue
-					}
-					entryID := uuid.New().String()
-					messageData := map[string]interface{}{
-						"id":                     entryID,
-						"discordAuthorID":        message["author"].(map[string]interface{})["id"],
-						"discordServerID":        guild.ID,
-						"discordAuthorUsername":  message["author"].(map[string]interface{})["username"],
-						"discordMessageID":       message["id"],
-						"discordMessageContent":  message["content"],
-						"discordTimestamp":       message["timestamp"],
-						"discordEditedTimestamp": message["edited_timestamp"],
-					}
-					messageBuffer = append(messageBuffer, messageData)
-					if len(messageBuffer) >= batchSize {
-						writeBatchToFile(messageBuffer)
-						messageBuffer = nil // Clear buffer
-					}
+
+				for _, channel := range channels {
+					wg.Add(1)
+					go func(token, channelID, guildID string) {
+						defer wg.Done()
+						messages := getMessages(token, channelID)
+						if messages == nil {
+							fmt.Println("Error: nil messages received")
+							return
+						}
+
+						for _, message := range messages {
+							if message["content"] == nil {
+								currentTime := time.Now()
+								timeOnly := currentTime.Format("15:04:05")
+								fmt.Println("Skipping message with missing content @ " + timeOnly)
+								continue
+							}
+
+							entryID := uuid.New().String()
+							messageData := map[string]interface{}{
+								"id":                     entryID,
+								"discordAuthorID":        message["author"].(map[string]interface{})["id"],
+								"discordServerID":        guildID,
+								"discordAuthorUsername":  message["author"].(map[string]interface{})["username"],
+								"discordMessageID":       message["id"],
+								"discordMessageContent":  message["content"],
+								"discordTimestamp":       message["timestamp"],
+								"discordEditedTimestamp": message["edited_timestamp"],
+							}
+							messageBuffer <- messageData
+						}
+					}(token, channel.ID, guild.ID)
 				}
 			}
-			// Write remaining messages as a final batch
-			if len(messageBuffer) > 0 {
-				writeBatchToFile(messageBuffer)
-			}
-		}
+		}(token)
 	}
+
+	go func() {
+		wg.Wait()
+		close(messageBuffer)
+	}()
+
+	for i := 0; i < maxWorkers; i++ {
+		go func() {
+			var messages []map[string]interface{}
+			for message := range messageBuffer {
+				messages = append(messages, message)
+				if len(messages) >= batchSize {
+					writeBatchToFile(messages, fileName)
+					messages = nil // Clear buffer
+				}
+			}
+			if len(messages) > 0 {
+				writeBatchToFile(messages, fileName)
+			}
+		}()
+	}
+
 	fmt.Println("User info, guilds, and channels for each token saved to accounts.json.")
-	fmt.Println("Message data saved to message_data.json.")
+	fmt.Println("Message data saved to message_data.jsonl.")
 }
 
-func writeBatchToFile(messages []map[string]interface{}) {
+func writeBatchToFile(messages []map[string]interface{}, fileName string) {
 	fileMutex.Lock()
 	defer fileMutex.Unlock()
 
-	f, err := os.OpenFile("message_data.json", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		fmt.Println("Error opening message log file:", err)
 		return
@@ -285,7 +313,7 @@ func writeBatchToFile(messages []map[string]interface{}) {
 			continue
 		}
 	}
-	fmt.Printf("Batch of %d messages appended to message_data.json\n", len(messages))
+	fmt.Printf("Batch of %d messages appended to %s\n", len(messages), fileName)
 }
 
 func getMessages(token, channelID string) []map[string]interface{} {
@@ -356,7 +384,7 @@ func filterInvites() {
 func parseMessages() []string {
 	var messages []string
 
-	file, err := os.Open("message_data.json")
+	file, err := os.Open("message_data.jsonl")
 	if err != nil {
 		fmt.Println("Error opening message data file:", err)
 		return messages
